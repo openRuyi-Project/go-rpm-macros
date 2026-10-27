@@ -10,27 +10,125 @@
 %gopath /usr/share/gocode
 %go_sys_gopath %{gopath}/src
 
-# Generate metadata consumed by the RPM Go file attribute generator. This can
-# be called from a custom %install with an explicit import path and version:
+# Generate .goipath markers in the final installed source tree; go.attr and
+# go-rpm-integration turn those packaged markers into RPM Provides. Call this
+# after any custom install step that moves or removes Go source directories.
+#
+# go_submodules assigns owning-module versions, not one entry per Go package.
+# Keys use installed import paths, which can differ from upstream module paths.
+# Versions must already be RPM Version values, without Epoch or Release; this
+# macro does not discover module versions or derive snapshot packaging dates.
+# Each non-empty, non-comment line must contain exactly PATH VERSION, separated
+# by spaces or tabs. Only whole-line comments are supported. Duplicate paths
+# are rejected even when their versions agree, so table order is irrelevant.
+# A key matches itself and slash-delimited descendants: sub does not match
+# submarine. The longest match wins; non-nested packages without an override
+# use -v or %{version}. Valid entries without an installed package on this
+# architecture are allowed.
+# The table is the only source of overrides: finding a nested go.mod does not
+# supply that module's own version. If go_submodules is defined, each nested
+# module that contains an eligible library package needs an exact table entry;
+# a parent entry cannot provide its version. Without the table, unmatched
+# packages retain the legacy -v or %{version} fallback. The macro validates
+# missing mappings; go2spec is responsible for selecting modules and versions.
+# For the table below, submodule/child gets 2.0.0, submodule/nested/leaf gets
+# 3.0.0, and submodule-extra uses the default only if no nested go.mod owns it.
+#   %global go_submodules %{expand:
+#   example.org/project/submodule 2.0.0
+#   example.org/project/submodule/nested 3.0.0
+#   }
+# Only eligible library directories receive markers; the table does not create
+# capabilities for empty module roots, commands, or compatibility aliases.
+# The marker must be packaged alongside its source: merely writing it under
+# buildroot is insufficient for the RPM file attribute generator to see it.
+# This can be called from a custom %install with an explicit import path and version:
 #   %go_generate_provides -i example.org/project -v %{version}
+# The expanded body must remain POSIX sh-compatible; the caller need not use Bash.
 %go_generate_provides(i:v:) %{expand:\
+  # Keep cd, exported Go settings and the cleanup trap local to this invocation. \
   ( \
     _go_import_path="%{-i*}" ; \
     _go_version="%{-v*}" ; \
     [ -n "$_go_import_path" ] || _go_import_path="%{go_import_path}" ; \
     [ -n "$_go_version" ] || _go_version="%{version}" ; \
     _go_source_root="%{buildroot}%{go_sys_gopath}" ; \
+    # RPM expands the table first; shell quoting must preserve it as literal data. \
+    # Apostrophes and command substitutions can occur even in ignored comments. \
+    # This protects shell parsing, not against RPM macro expansion in the table. \
+    _go_submodules=%{shescape:%{?go_submodules}} ; \
+    # Character ranges in validation must mean ASCII regardless of build locale. \
+    LC_ALL=C ; \
+    export LC_ALL ; \
     if [ ! -d "$_go_source_root/$_go_import_path" ]; then \
       echo "Go import root is not installed: $_go_import_path" >&2 ; \
       exit 1 ; \
     fi ; \
     cd "$_go_source_root/$_go_import_path" || exit 1 ; \
+    # GOPATH mode scans the installed layout across nested go.mod boundaries. \
+    # The build-time checkout may contain packages that the spec did not install; \
+    # using it here would advertise capabilities absent from the binary RPM. \
     export GOPATH=%{buildroot}%{gopath} GO111MODULE=off ; \
     _go_list_dir=$(mktemp -d) || exit 1 ; \
-    trap 'rm -rf "$_go_list_dir"' EXIT ; \
+    trap 'rm -rf "$_go_list_dir"' 0 ; \
+    # Keep discovery, selection and resolved versions separate from marker writes. \
+    # A malformed table or failed discovery must not leave new partial metadata. \
     _go_list_file="$_go_list_dir/list" ; \
     _go_package_file="$_go_list_dir/packages" ; \
+    _go_version_file="$_go_list_dir/package-versions" ; \
+    _go_submodule_file="$_go_list_dir/submodules" ; \
+    _go_nested_module_file="$_go_list_dir/nested-modules" ; \
+    _go_submodules_defined="%{?go_submodules:1}" ; \
+    _go_tab=$(printf '\\t') ; \
     : >"$_go_package_file" ; \
+    : >"$_go_submodule_file" ; \
+    : >"$_go_nested_module_file" ; \
+    # Reject the entire table before writing any markers, even for unused keys. \
+    # read assigns all remaining fields to extra, so inline comments are errors. \
+    # The loop runs in a pipeline subshell; its failure must also exit the caller. \
+    printf '%s\\n' "$_go_submodules" | \
+      while IFS=" $_go_tab" read -r _go_submodule _go_submodule_version _go_submodule_extra; do \
+        case "$_go_submodule" in \
+          ""|"#"*) continue ;; \
+        esac ; \
+        if [ -z "$_go_submodule_version" ] || [ -n "$_go_submodule_extra" ]; then \
+          echo "go-provides: invalid go_submodules entry: $_go_submodule $_go_submodule_version $_go_submodule_extra" >&2 ; \
+          exit 1 ; \
+        fi ; \
+        # Match exact import-path components, not globs or filesystem aliases. \
+        # Reject unresolved macro syntax as well as empty, dot and dot-dot parts. \
+        case "$_go_submodule" in \
+          *[!A-Za-z0-9._~+/-]*|/*|*/|*//*|.|..|./*|../*|*/./*|*/../*|*/.|*/..) \
+            echo "go-provides: invalid go_submodules path: $_go_submodule" >&2 ; \
+            exit 1 ; \
+            ;; \
+        esac ; \
+        # RPM ordering allows ~ and ^ here, but an Epoch or Release would change \
+        # the meaning of the generated equality. Punctuation alone is no version. \
+        case "$_go_submodule_version" in \
+          *[!A-Za-z0-9._+~^]*) \
+            echo "go-provides: invalid go_submodules version: $_go_submodule_version" >&2 ; \
+            exit 1 ; \
+            ;; \
+          *[A-Za-z0-9]*) ;; \
+          *) \
+            echo "go-provides: invalid go_submodules version: $_go_submodule_version" >&2 ; \
+            exit 1 ; \
+            ;; \
+        esac ; \
+        # Reject duplicates before awk can silently turn them into last-row-wins. \
+        while IFS="$_go_tab" read -r _go_existing_submodule _go_existing_version; do \
+          if [ "$_go_existing_submodule" = "$_go_submodule" ]; then \
+            echo "go-provides: duplicate go_submodules entry: $_go_submodule" >&2 ; \
+            exit 1 ; \
+          fi ; \
+        done <"$_go_submodule_file" ; \
+        printf '%s\\t%s\\n' "$_go_submodule" "$_go_submodule_version" >>"$_go_submodule_file" || exit 1 ; \
+      done || exit 1 ; \
+    # With -e, package errors are skippable records; command failure stays fatal. \
+    # Error takes precedence over package kind. Main packages are not libraries, \
+    # and test-only directories do not provide an ordinary importable package. \
+    # Quoted error text escapes embedded newlines to keep one record per package. \
+    # Capture the command status separately: a partial list is not a valid scan. \
     if %__go list -e -f '{{if .Error}}error|{{.ImportPath}}|{{printf "%q" .Error.Err}}{{else if eq .Name "main"}}main|{{.ImportPath}}{{else if not (or .GoFiles .CgoFiles .SFiles)}}nosource|{{.ImportPath}}{{else}}package|{{.ImportPath}}{{end}}' "$_go_import_path/..." >"$_go_list_file" ; then \
       _go_list_rc=0 ; \
     else \
@@ -42,6 +140,7 @@
     _go_skipped_nosource=0 ; \
     _go_skipped_examples=0 ; \
     _go_errors=0 ; \
+    # Redirect input instead of piping into this loop: counters must survive it. \
     while IFS='|' read -r _go_kind _go_package _go_error; do \
       case "$_go_kind" in \
         error) \
@@ -50,6 +149,8 @@
           ;; \
         package) \
           _go_packages=$((_go_packages + 1)) ; \
+          # Only descendants of the requested root may become marker paths. \
+          # Apply example filtering to the relative path, not the module prefix. \
           if [ "$_go_package" = "$_go_import_path" ]; then \
             _go_relative_package="" ; \
           elif [ "${_go_package#"$_go_import_path"/}" != "$_go_package" ]; then \
@@ -72,6 +173,44 @@
         nosource) _go_skipped_nosource=$((_go_skipped_nosource + 1)) ;; \
       esac ; \
     done <"$_go_list_file" ; \
+    if [ "$_go_list_rc" -eq 0 ]; then \
+      if ! find . -type f -name go.mod -print >"$_go_list_dir/go-mod-files"; then \
+        echo "go-provides: failed to find nested go.mod files under $_go_import_path" >&2 ; \
+        exit 1 ; \
+      fi ; \
+      while IFS= read -r _go_mod_file; do \
+        [ "$_go_mod_file" = ./go.mod ] && continue ; \
+        _go_mod_dir=${_go_mod_file#./} ; \
+        _go_mod_dir=${_go_mod_dir%/go.mod} ; \
+        printf '%s/%s\\n' "$_go_import_path" "$_go_mod_dir" >>"$_go_nested_module_file" || exit 1 ; \
+      done <"$_go_list_dir/go-mod-files" ; \
+      if [ "$_go_submodules_defined" = 1 ]; then \
+        while IFS= read -r _go_package; do \
+          _go_owner_module= ; \
+          while IFS= read -r _go_nested_module; do \
+            case "$_go_package" in \
+              "$_go_nested_module"|"$_go_nested_module"/*) \
+                if [ "${#_go_nested_module}" -gt "${#_go_owner_module}" ]; then \
+                  _go_owner_module=$_go_nested_module ; \
+                fi ; \
+                ;; \
+            esac ; \
+          done <"$_go_nested_module_file" ; \
+          [ -n "$_go_owner_module" ] || continue ; \
+          _go_exact_mapping=0 ; \
+          while IFS="$_go_tab" read -r _go_table_path _go_table_version; do \
+            if [ "$_go_table_path" = "$_go_owner_module" ]; then \
+              _go_exact_mapping=1 ; \
+              break ; \
+            fi ; \
+          done <"$_go_submodule_file" ; \
+          if [ "$_go_exact_mapping" -eq 0 ]; then \
+            echo "go-provides: unmapped nested module: $_go_owner_module (add an exact go_submodules entry)" >&2 ; \
+            exit 1 ; \
+          fi ; \
+        done <"$_go_package_file" ; \
+      fi ; \
+    fi ; \
     echo "go-provides: packages=$_go_packages markers=$_go_markers skipped-main=$_go_skipped_main skipped-no-source=$_go_skipped_nosource skipped-examples=$_go_skipped_examples errors=$_go_errors" >&2 ; \
     if [ "$_go_list_rc" -ne 0 ]; then \
       echo "go-provides: go list failed for $_go_import_path (rc=$_go_list_rc)" >&2 ; \
@@ -80,9 +219,44 @@
     if [ "$_go_errors" -ne 0 ]; then \
       echo "go-provides: skipped $_go_errors packages with errors" >&2 ; \
     fi ; \
-    while IFS= read -r _go_package; do \
-      printf 'version:%s\n' "$_go_version" > "$_go_source_root/$_go_package/.goipath" || exit 1 ; \
-    done <"$_go_package_file" ; \
+    # Nearest slash-delimited ancestor wins, independent of table order. \
+    # Load the validated table once; walk each package through its ancestor paths \
+    # instead of running a shell tool or scanning every table row per package. \
+    %__awk -F "$_go_tab" -v top_version="$_go_version" -v separator="$_go_tab" ' \
+      # Unlike NR == FNR, this also distinguishes an empty first input file. \
+      # With no overrides, package lines must still take the fallback branch. \
+      FILENAME == ARGV[1] { versions[$1] = $2; next } \
+      { \
+        candidate = $0 ; \
+        selected = top_version ; \
+        # A path such as project/sub/nested/leaf probes itself, then nested, \
+        # then sub. Trimming complete components cannot match sub to submarine. \
+        while (candidate != "") { \
+          if (candidate in versions) { \
+            selected = versions[candidate] ; \
+            break ; \
+          } \
+          slash = 0 ; \
+          for (i = length(candidate); i > 0; i--) { \
+            if (substr(candidate, i, 1) == "/") { \
+              slash = i ; \
+              break ; \
+            } \
+          } \
+          if (slash == 0) break ; \
+          candidate = substr(candidate, 1, slash - 1) ; \
+        } \
+        print $0 separator selected ; \
+      } \
+    ' "$_go_submodule_file" "$_go_package_file" >"$_go_version_file" || exit 1 ; \
+    # Marker contents are a protocol with go-rpm-integration, not a Go version \
+    # file: one version: line with a newline. The helper gets the import path \
+    # from the containing directory, so markers must stay beside their sources. \
+    # Validation is complete, but these writes are not an atomic transaction; \
+    # an I/O failure must fail the build rather than package incomplete metadata. \
+    while IFS="$_go_tab" read -r _go_package _go_package_version; do \
+      printf 'version:%s\\n' "$_go_package_version" >"$_go_source_root/$_go_package/.goipath" || exit 1 ; \
+    done <"$_go_version_file" ; \
   ) \
 }
 
